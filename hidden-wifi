@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# hidden-wifi: connect to a hidden Wi-Fi network using NetworkManager (nmcli).
+
+command -v nmcli >/dev/null || { echo "Error: nmcli not found. This script requires NetworkManager."; exit 1; }
+
+read -rp "Network name (SSID): " ssid
+read -rp "Password: " pass
+read -rp "Security [wpa2/wpa3] (Enter = wpa2): " sec
+
+[[ -z "$ssid" ]] && { echo "Error: SSID is empty."; exit 1; }
+[[ ${#pass} -lt 8 ]] && { echo "Error: password must be at least 8 characters."; exit 1; }
+
+case "${sec:-wpa2}" in
+  wpa3) km=sae ;;
+  *)    km=wpa-psk ;;
+esac
+
+dev=$(nmcli -t -f DEVICE,TYPE device | awk -F: '$2=="wifi"{print $1; exit}')
+[[ -z "$dev" ]] && { echo "Error: no Wi-Fi device found."; exit 1; }
+
+# Remove any old profile with the same name so we always start clean
+nmcli connection delete "$ssid" &>/dev/null
+
+nmcli connection add type wifi ifname "$dev" con-name "$ssid" ssid "$ssid" \
+  wifi.hidden yes wifi-sec.key-mgmt "$km" wifi-sec.psk "$pass" \
+  connection.autoconnect yes >/dev/null
+
+if out=$(nmcli connection up "$ssid" 2>&1); then
+  echo "Connected to $ssid."
+else
+  # Don't leave a broken profile behind
+  nmcli connection delete "$ssid" &>/dev/null
+  case "$out" in
+    *"Secrets were required"*)
+      echo "Error: wrong password, or wrong security type (try wpa3)." ;;
+    *"could not be found"*|*"No suitable device"*|*"timeout"*)
+      echo "Error: network not found. Check the SSID (case, spaces) and that you are in range." ;;
+    *)
+      echo "Error: $out" ;;
+  esac
+  exit 1
+fi
