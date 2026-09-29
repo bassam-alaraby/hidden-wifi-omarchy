@@ -15,7 +15,7 @@ It asks for the SSID, password and security type, creates the profile, connects,
 
 ```bash
 mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/bassam-alaraby/hidden-wifi/main/hidden-wifi -o ~/.local/bin/hidden-wifi
+curl -fsSL https://raw.githubusercontent.com/bassam-alaraby/hidden-wifi-omarchy/main/hidden-wifi -o ~/.local/bin/hidden-wifi
 chmod +x ~/.local/bin/hidden-wifi
 ```
 
