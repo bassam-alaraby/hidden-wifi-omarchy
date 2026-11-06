@@ -1,42 +1,127 @@
 #!/usr/bin/env bash
 # hidden-wifi: connect to a hidden Wi-Fi network using NetworkManager (nmcli).
+set -u
 
-command -v nmcli >/dev/null || { echo "Error: nmcli not found. This script requires NetworkManager."; exit 1; }
+# --- UI -----------------------------------------------------------------
+# Colour only on a real terminal (and not when NO_COLOR is set), so output
+# stays clean ASCII when piped to a file or log.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  B=$'\033[1m'; G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; Z=$'\033[0m'
+else
+  B= G= R= Y= Z=
+fi
+
+hdr() {
+  printf '%s+---------------------------------------------------------------+%s\n' "$B" "$Z"
+  printf '%s|  %-61s|%s\n' "$B" "hidden-wifi" "$Z"
+  printf '%s|  %-61s|%s\n' "$B" "Connect to a hidden (non-broadcast) Wi-Fi network" "$Z"
+  printf '%s+---------------------------------------------------------------+%s\n\n' "$B" "$Z"
+}
+step() { printf '%s[%s/4] %s%s\n' "$B" "$1" "$Z" "$2"; }
+ok()   { printf '      %s[OK]%s   %s\n' "$G" "$Z" "$*"; }
+fail() { printf '      %s[FAIL]%s %s\n' "$R" "$Z" "$*"; }
+note() { printf '      %s%s%s\n' "$Y" "$*" "$Z"; }
+die()  { fail "$1"; exit "${2:-1}"; }
+
+# Remove the profile we created if we exit before connecting, so a failed
+# or interrupted run never leaves a broken profile behind.
+ssid="" created=0 connected=0
+cleanup() {
+  if [[ "$created" == 1 && "$connected" == 0 && -n "$ssid" ]]; then
+    nmcli connection delete "$ssid" >/dev/null 2>&1
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+hdr
+
+# --- 1/4: preflight -----------------------------------------------------
+step 1 "Checking Wi-Fi"
+
+command -v nmcli >/dev/null || die "nmcli not found. This script requires NetworkManager." 1
+nmcli general status >/dev/null 2>&1 \
+  || die "NetworkManager doesn't appear to be running. Start it, then try again." 1
+[[ "$(nmcli radio wifi 2>/dev/null)" != "disabled" ]] \
+  || die "Wi-Fi radio is off. Run: nmcli radio wifi on" 1
+
+dev=$(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')
+[[ -n "$dev" ]] || die "No Wi-Fi device found. Check the driver, or run: nmcli device status" 1
+ok "Wi-Fi device: $dev"
+
+# --- 2/4: network details ----------------------------------------------
+step 2 "Network details"
 
 read -rp "Network name (SSID): " ssid
+[[ -n "$ssid" ]] || die "SSID is empty." 1
+(( $(printf %s "$ssid" | wc -c) <= 32 )) \
+  || die "SSID must be 32 bytes or less (Wi-Fi limit)." 1
+
 read -rp "Password: " pass
-read -rp "Security [wpa2/wpa3] (Enter = wpa2): " sec
+(( ${#pass} >= 8 && ${#pass} <= 63 )) \
+  || die "Password must be 8-63 characters (WPA/WPA2/WPA3 requirement)." 1
 
-[[ -z "$ssid" ]] && { echo "Error: SSID is empty."; exit 1; }
-[[ ${#pass} -lt 8 ]] && { echo "Error: password must be at least 8 characters."; exit 1; }
+while :; do
+  read -rp "Security [wpa2/wpa3] (Enter = wpa2): " sec
+  case "${sec:-wpa2}" in
+    wpa2) km=wpa-psk; break ;;
+    wpa3) km=sae; break ;;
+    *) note "Please enter wpa2 or wpa3 (Enter = wpa2)." ;;
+  esac
+done
 
-case "${sec:-wpa2}" in
-  wpa3) km=sae ;;
-  *)    km=wpa-psk ;;
-esac
+# --- 3/4: create the profile -------------------------------------------
+step 3 "Creating profile"
 
-dev=$(nmcli -t -f DEVICE,TYPE device | awk -F: '$2=="wifi"{print $1; exit}')
-[[ -z "$dev" ]] && { echo "Error: no Wi-Fi device found."; exit 1; }
+if nmcli -t -f NAME connection show 2>/dev/null | grep -Fxq -- "$ssid"; then
+  read -rp "Profile '$ssid' already exists. Replace it? [y/N] " yn
+  case "$yn" in
+    [yY]|[yY]es) ;;
+    *) note "Aborted. Existing profile left untouched."; exit 0 ;;
+  esac
+  nmcli connection delete "$ssid" >/dev/null 2>&1 \
+    || die "Could not delete existing profile '$ssid'." 1
+fi
 
-# Remove any old profile with the same name so we always start clean
-nmcli connection delete "$ssid" &>/dev/null
+created=1
+if out=$(nmcli connection add type wifi ifname "$dev" con-name "$ssid" ssid "$ssid" \
+      wifi.hidden yes wifi-sec.key-mgmt "$km" wifi-sec.psk "$pass" \
+      connection.autoconnect yes 2>&1); then
+  ok "Profile '$ssid' created"
+else
+  fail "Could not create profile"
+  printf '      %s\n' "$out"
+  exit 2
+fi
 
-nmcli connection add type wifi ifname "$dev" con-name "$ssid" ssid "$ssid" \
-  wifi.hidden yes wifi-sec.key-mgmt "$km" wifi-sec.psk "$pass" \
-  connection.autoconnect yes >/dev/null
+# --- 4/4: connect -------------------------------------------------------
+step 4 "Connecting"
 
 if out=$(nmcli connection up "$ssid" 2>&1); then
-  echo "Connected to $ssid."
+  connected=1
+  ok "Connected to $ssid"
+  active=$(nmcli -t -f ACTIVE connection show "$ssid" 2>/dev/null | head -1)
+  [[ "$active" == "yes" ]] \
+    || note "Profile is up but not active yet; check: nmcli connection show '$ssid'"
+  ip=$(nmcli -t -f IP4.ADDRESS connection show "$ssid" 2>/dev/null | head -1)
+  [[ -n "$ip" ]] && note "Device: $dev   IP: ${ip%%/*}"
+  printf '\n%sDone. It reconnects automatically when the network is in range.%s\n' "$B" "$Z"
 else
-  # Don't leave a broken profile behind
-  nmcli connection delete "$ssid" &>/dev/null
+  fail "Connection failed"
   case "$out" in
-    *"Secrets were required"*)
-      echo "Error: wrong password, or wrong security type (try wpa3)." ;;
-    *"could not be found"*|*"No suitable device"*|*"timeout"*)
-      echo "Error: network not found. Check the SSID (case, spaces) and that you are in range." ;;
-    *)
-      echo "Error: $out" ;;
+    *"Secrets were required"*|*"psk mismatch"*|*"802-11-wireless-security.psk"*)
+      note "Likely wrong password, or wrong security type (try wpa3)." ;;
+    *"could not be found"*|*"No suitable device"*|*"timeout"*|*"failed to find"*)
+      note "Network not found. Check the SSID (case, spaces) and that you are in range." ;;
+    *"not ready"*|*"not available"*|*"in progress"*)
+      note "Device is busy or not ready. Wait a few seconds and run again." ;;
+    *"radio"*|*"Wi-Fi is disabled"*)
+      note "Wi-Fi radio is off. Run: nmcli radio wifi on" ;;
+    *"not authorized"*|*"Not authorized"*|*"permission"*)
+      note "Permission denied. You may need to authorize NetworkManager (polkit)." ;;
+    *) note "$out" ;;
   esac
-  exit 1
+  note "Removed the failed profile, so you can retry cleanly."
+  exit 3
 fi
